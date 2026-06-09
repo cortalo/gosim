@@ -5,6 +5,7 @@ import (
 	_ "embed"
 	"flag"
 	"go/token"
+	"go/types"
 	"log"
 	"os"
 	"path"
@@ -217,7 +218,33 @@ func reloadUncachedPackages(listedPkgs []*packages.Package, uncachedPackages map
 		}
 	}
 
+	// Go's type checker populates TypesInfo.InitOrder for ForTest packages with
+	// initializers from ALL files (base + _test.go). But gosim's ForTest pass
+	// only decorates _test.go files, so dstMap only contains nodes from those
+	// files. Strip base-file initializers here so downstream code never sees them.
+	for _, pkg := range pkgsWithTypesAndAst {
+		if strings.HasSuffix(pkg.ID, ".test]") {
+			pkg.TypesInfo.InitOrder = filterTestFileInitializers(pkg)
+		}
+	}
+
 	return pkgsWithTypesAndAst
+}
+
+// filterTestFileInitializers returns only the initializers whose LHS variable
+// is declared in a _test.go file.
+func filterTestFileInitializers(pkg *packages.Package) []*types.Initializer {
+	var filtered []*types.Initializer
+	for _, init := range pkg.TypesInfo.InitOrder {
+		if len(init.Lhs) == 0 {
+			continue
+		}
+		f := pkg.Fset.File(init.Lhs[0].Pos())
+		if f != nil && strings.HasSuffix(f.Name(), "_test.go") {
+			filtered = append(filtered, init)
+		}
+	}
+	return filtered
 }
 
 type packageKind string
