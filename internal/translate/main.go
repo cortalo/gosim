@@ -417,16 +417,9 @@ func checkSingleModule(modPath string, pkgs []*packages.Package) {
 	}
 }
 
-func translatePackages(cache *cache.Cache, listPatterns []string, rootOutputDir string, cfg gosimtool.BuildConfig) (*gosimtool.TranslateOutput, error) {
-	if *cpuprofile != "" {
-		f, err := os.Create(*cpuprofile)
-		if err != nil {
-			log.Fatal(err)
-		}
-		pprof.StartCPUProfile(f)
-		defer pprof.StopCPUProfile()
-	}
-
+// discoverPackages loads packages, validates the module, and builds the
+// dependency graph used to drive translation order.
+func discoverPackages(listPatterns []string, cfg gosimtool.BuildConfig) ([]*packages.Package, *depGraph) {
 	listPatterns = append(listPatterns, TranslatedRuntimePackages...)
 
 	listedPkgs, err := loadPackages(listPatterns, cfg, loadDepGraph, true)
@@ -441,21 +434,16 @@ func translatePackages(cache *cache.Cache, listPatterns []string, rootOutputDir 
 	if err != nil {
 		log.Fatal(err)
 	}
-	modDir := path.Dir(modPath)
 
 	checkGosimDep(modFile)
 	checkSingleModule(modPath, listedPkgs)
 
-	allPkgs := collectImports(listedPkgs, nil)
 	convertPkgs := collectImports(listedPkgs, skippedPackagesGo123)
 
-	packageGraph := newDepGraph()
+	graph := newDepGraph()
 	basePkgs := make(map[string]*packages.Package)
-	pkgById := make(map[string]*packages.Package)
 	for _, pkg := range convertPkgs {
-		packageGraph.addNode(pkg.ID)
-		pkgById[pkg.ID] = pkg
-
+		graph.addNode(pkg.ID)
 		if kind, path := classifyPackage(pkg); kind == PackageKindBase {
 			basePkgs[path] = pkg
 		}
@@ -463,18 +451,18 @@ func translatePackages(cache *cache.Cache, listPatterns []string, rootOutputDir 
 
 	for _, pkg := range convertPkgs {
 		for _, dep := range pkg.Imports {
-			if _, ok := packageGraph.nodes[dep.ID]; !ok {
+			if _, ok := graph.nodes[dep.ID]; !ok {
 				// XXX?
 				continue
 			}
-			packageGraph.addDep(pkg.ID, dep.ID)
+			graph.addDep(pkg.ID, dep.ID)
 		}
 
 		// XXX: add a package from the "for test" to the "main" package
 		kind, path := classifyPackage(pkg)
 		if kind == PackageKindForTest || kind == PackageKindTests {
 			if basePkgs[path] != nil {
-				packageGraph.addDep(pkg.ID, basePkgs[path].ID)
+				graph.addDep(pkg.ID, basePkgs[path].ID)
 			} else {
 				log.Println("huh", kind, pkg.PkgPath, path)
 				log.Fatal(":(")
@@ -482,13 +470,25 @@ func translatePackages(cache *cache.Cache, listPatterns []string, rootOutputDir 
 		}
 	}
 
-	translateToolHash := computeTranslateToolHash(cfg)
+	return listedPkgs, graph
+}
 
+// runTranslations checks the cache, translates uncached packages, and writes
+// results back to the cache. It returns the per-package results and the
+// package name mappings needed to write the final output.
+func runTranslations(c *cache.Cache, listedPkgs []*packages.Package, graph *depGraph, cfg gosimtool.BuildConfig) (results map[string]*TranslatePackageResult, replacedPkgs map[string]string) {
+	allPkgs := collectImports(listedPkgs, nil)
+	convertPkgs := collectImports(listedPkgs, skippedPackagesGo123)
+	pkgById := make(map[string]*packages.Package, len(convertPkgs))
+	for _, pkg := range convertPkgs {
+		pkgById[pkg.ID] = pkg
+	}
+
+	translateToolHash := computeTranslateToolHash(cfg)
 	numWorkers := 32
 
 	packageHashes := make(map[string]Hash)
-
-	buildInParallel(packageGraph, numWorkers, packageHashes, func(pkgId string, importHashes map[string]Hash) Hash {
+	buildInParallel(graph, numWorkers, packageHashes, func(pkgId string, importHashes map[string]Hash) Hash {
 		return computePackageHash(translateToolHash, pkgById[pkgId], importHashes)
 	})
 
@@ -499,7 +499,7 @@ func translatePackages(cache *cache.Cache, listPatterns []string, rootOutputDir 
 	for pkgId, hash := range packageHashes {
 		pkg := pkgById[pkgId]
 
-		res, err := cacheGet(cache, hash)
+		res, err := cacheGet(c, hash)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -512,10 +512,9 @@ func translatePackages(cache *cache.Cache, listPatterns []string, rootOutputDir 
 	}
 
 	pkgsWithTypesAndAst := reloadUncachedPackages(listedPkgs, uncachedPackages, cfg)
-
 	replacedPkgs, packageNames := buildReplacePackagesAndPackageNames(convertPkgs, allPkgs)
 
-	buildInParallel(packageGraph, numWorkers, allResults, func(pkgId string, localResults map[string]*TranslatePackageResult) *TranslatePackageResult {
+	buildInParallel(graph, numWorkers, allResults, func(pkgId string, localResults map[string]*TranslatePackageResult) *TranslatePackageResult {
 		return translatePackage(&translatePackageArgs{
 			cfg:                cfg,
 			pkg:                pkgById[pkgId],
@@ -530,21 +529,41 @@ func translatePackages(cache *cache.Cache, listPatterns []string, rootOutputDir 
 	for pkgId, res := range allResults {
 		hash := packageHashes[pkgId]
 		if !cacheHits[hash] {
-			if err := cachePut(cache, hash, res); err != nil {
+			if err := cachePut(c, hash, res); err != nil {
 				log.Fatal(err)
 			}
 		}
 	}
 
+	return allResults, replacedPkgs
+}
+
+func translatePackages(c *cache.Cache, listPatterns []string, rootOutputDir string, cfg gosimtool.BuildConfig) (*gosimtool.TranslateOutput, error) {
+	if *cpuprofile != "" {
+		f, err := os.Create(*cpuprofile)
+		if err != nil {
+			log.Fatal(err)
+		}
+		pprof.StartCPUProfile(f)
+		defer pprof.StopCPUProfile()
+	}
+
+	listedPkgs, graph := discoverPackages(listPatterns, cfg)
+	results, replacedPkgs := runTranslations(c, listedPkgs, graph, cfg)
+
+	modPath, modFile, err := gosimtool.FindGoMod()
+	if err != nil {
+		log.Fatal(err)
+	}
+	modDir := path.Dir(modPath)
+
 	writer := newOutputWriter()
-	for _, res := range allResults {
+	for _, res := range results {
 		if err := writer.merge(res.TranslatedFiles); err != nil {
 			log.Fatal(err)
 		}
 	}
-
 	writeGoModFile(modDir, modFile, writer)
-
 	if err := writer.writeFiles(rootOutputDir); err != nil {
 		log.Fatal(err)
 	}
