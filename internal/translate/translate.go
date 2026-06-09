@@ -67,6 +67,9 @@ type TranslatePackageResult struct {
 	CollectedTests  []packageSelector
 	GlobalInfo      *PackageGlobalInfo
 	TranslatedFiles map[string][]byte
+	// BindNames is populated for PackageKindBase: the set of Bind function
+	// names already generated, so PackageKindForTest can skip duplicates.
+	BindNames map[string]bool
 }
 
 func filterTestFiles(files []*ast.File, fset *token.FileSet) []*ast.File {
@@ -344,6 +347,18 @@ func translatePackage(args *translatePackageArgs) *TranslatePackageResult {
 		}
 	}
 
+	// ForTest only emits Bind functions not already emitted by Base, avoiding
+	// duplicate declarations when both variants land in the same output package.
+	if kind == PackageKindForTest {
+		if baseResult := args.importResults[extractedPath]; baseResult != nil {
+			for bs := range translator.collect.bindspecs {
+				if baseResult.BindNames[bs.Name()] {
+					delete(translator.collect.bindspecs, bs)
+				}
+			}
+		}
+	}
+
 	if globalsName, ok := map[packageKind]string{
 		PackageKindBase:    "gosim_globals.go",
 		PackageKindForTest: "gosim_globals_for_test.go",
@@ -403,6 +418,13 @@ func translatePackage(args *translatePackageArgs) *TranslatePackageResult {
 	results.GlobalInfo = globalInfo
 	results.PackagePath = args.pkg.PkgPath
 	results.TranslatedFiles = writer.extract()
+
+	if kind == PackageKindBase {
+		results.BindNames = make(map[string]bool)
+		for bs := range translator.collect.bindspecs {
+			results.BindNames[bs.Name()] = true
+		}
+	}
 
 	return &results
 }
