@@ -87,6 +87,14 @@ func (t *globalsCollector) collectGlobalsDecl(genDecl *dst.GenDecl) {
 	if genDecl.Tok != token.VAR {
 		return
 	}
+	// //go:embed variables are initialized by the linker, not by Go expressions,
+	// so they never appear in TypesInfo.InitOrder. Moving them into the per-Machine
+	// Globals struct would leave them nil at runtime. Keep them as package-level vars.
+	for _, dec := range genDecl.Decs.Start {
+		if strings.HasPrefix(strings.TrimSpace(dec), "//go:embed") {
+			return
+		}
+	}
 	for _, spec := range genDecl.Specs {
 		spec := spec.(*dst.ValueSpec)
 

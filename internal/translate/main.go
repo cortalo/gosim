@@ -115,7 +115,7 @@ const (
 	loadDepGraph = packages.NeedName | packages.NeedFiles | packages.NeedModule | packages.NeedImports | packages.NeedDeps
 	// loadSyntaxAndTypes relatively slowly loads detailed types and syntax information
 	loadSyntaxAndTypes = packages.NeedSyntax | packages.NeedName | packages.NeedTypes |
-		packages.NeedTypesInfo | packages.NeedFiles | packages.NeedImports
+		packages.NeedTypesInfo | packages.NeedFiles | packages.NeedImports | packages.NeedEmbedFiles
 )
 
 func loadPackages(patterns []string, b gosimtool.BuildConfig, mode packages.LoadMode, tests bool) ([]*packages.Package, error) {

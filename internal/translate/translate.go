@@ -397,6 +397,19 @@ func translatePackage(args *translatePackageArgs) *TranslatePackageResult {
 		}
 	}
 
+	if kind == PackageKindBase {
+		// copy embedded files so //go:embed directives in translated code resolve correctly
+		for _, filePath := range args.pkg.EmbedFiles {
+			bytes, err := os.ReadFile(filePath)
+			if err != nil {
+				log.Fatal(err)
+			}
+			if err := writer.stage(pathForFile(outputPackage, filepath.Base(filePath)), bytes); err != nil {
+				log.Fatal(err)
+			}
+		}
+	}
+
 	// write a gosimaliashack.go file if needed
 	if kind == PackageKindBase {
 		// XXX: compute these automatically?
